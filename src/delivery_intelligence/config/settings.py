@@ -31,6 +31,14 @@ class GitLabSettings(BaseModel):
             raise ValueError("per_page must be between 1 and 100 inclusive")
         return v
 
+    @field_validator("max_retries")
+    @classmethod
+    def validate_max_retries(cls, v: int) -> int:
+        """Enforce max_retries is >= 0."""
+        if v < 0:
+            raise ValueError("max_retries must be >= 0")
+        return v
+
     @field_validator("timeout")
     @classmethod
     def validate_timeout(cls, v: int) -> int:

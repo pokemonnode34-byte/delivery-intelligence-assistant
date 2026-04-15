@@ -73,6 +73,24 @@ class TestGitLabSettings:
                 url="https://gitlab.example.com", token=SecretStr("t"), timeout=-5
             )
 
+    def test_max_retries_negative_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            GitLabSettings(
+                url="https://gitlab.example.com", token=SecretStr("t"), max_retries=-1
+            )
+
+    def test_max_retries_zero_is_valid(self) -> None:
+        s = GitLabSettings(
+            url="https://gitlab.example.com", token=SecretStr("t"), max_retries=0
+        )
+        assert s.max_retries == 0
+
+    def test_max_retries_positive_is_valid(self) -> None:
+        s = GitLabSettings(
+            url="https://gitlab.example.com", token=SecretStr("t"), max_retries=5
+        )
+        assert s.max_retries == 5
+
     def test_token_not_in_repr(self) -> None:
         s = GitLabSettings(
             url="https://gitlab.example.com", token=SecretStr("supersecret")
