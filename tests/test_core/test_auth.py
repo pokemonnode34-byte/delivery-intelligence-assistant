@@ -83,8 +83,8 @@ class TestGitLabAuth:
             api_version="v4",
         )
         r = repr(auth)
-        assert "https://gitlab.example.com" in r
-        assert "v4" in r
+        expected = "GitLabAuth(url=https://gitlab.example.com, api_version=v4, token=****)"
+        assert r == expected
 
     def test_str_equals_repr(self) -> None:
         auth = GitLabAuth(
