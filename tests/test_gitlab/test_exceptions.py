@@ -18,12 +18,12 @@ from delivery_intelligence.gitlab.exceptions import (
 def _make_response(
     status_code: int,
     *,
-    body: str = "{}",
+    response_text: str = "{}",
     headers: dict[str, str] | None = None,
     url: str = "https://gitlab.example.com/api/v4/projects/1/issues",
 ) -> httpx.Response:
     request = httpx.Request("GET", url)
-    return httpx.Response(status_code=status_code, text=body, headers=headers, request=request)
+    return httpx.Response(status_code=status_code, text=response_text, headers=headers or {}, request=request)
 
 
 def test_exception_attributes_and_string_representation() -> None:

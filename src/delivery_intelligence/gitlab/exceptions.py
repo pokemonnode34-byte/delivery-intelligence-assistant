@@ -14,6 +14,7 @@ _TOKEN_PATTERNS = (
 )
 
 _SAFE_URL_PATTERN = re.compile(r"^([^?#]+)")
+_MAX_RESPONSE_BODY_LENGTH = 500
 
 
 def _mask_sensitive_text(value: str | None) -> str | None:
@@ -168,7 +169,7 @@ def raise_for_status(response: httpx.Response, correlation_id: str | None = None
     request_url = _safe_request_url(response.request.url if response.request is not None else None)
     response_body = _mask_sensitive_text(response.text)
     if response_body is not None:
-        response_body = response_body[:500]
+        response_body = response_body[:_MAX_RESPONSE_BODY_LENGTH]
 
     if status_code == 401:
         raise GitLabAuthError(
