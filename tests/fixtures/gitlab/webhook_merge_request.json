@@ -1,0 +1,24 @@
+{
+  "object_kind": "merge_request",
+  "project": {"id": 1},
+  "project_id": 1,
+  "object_attributes": {
+    "id": 200,
+    "iid": 10,
+    "project_id": 1,
+    "title": "Add feature",
+    "description": null,
+    "state": "opened",
+    "source_branch": "feature/x",
+    "target_branch": "main",
+    "author": {"id": 42},
+    "assignees": [],
+    "reviewers": [],
+    "labels": [],
+    "has_conflicts": false,
+    "draft": false,
+    "created_at": "2024-01-01T00:00:00Z",
+    "updated_at": "2024-01-15T10:00:00Z",
+    "action": "open"
+  }
+}

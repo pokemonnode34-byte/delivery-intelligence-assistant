@@ -1,0 +1,14 @@
+{
+  "id": 500,
+  "project_id": 1,
+  "ref": "main",
+  "sha": "abc123def456",
+  "status": "success",
+  "source": "push",
+  "duration": 120,
+  "queued_duration": 5,
+  "started_at": "2024-01-15T09:58:00Z",
+  "finished_at": "2024-01-15T10:00:00Z",
+  "created_at": "2024-01-15T09:57:00Z",
+  "updated_at": "2024-01-15T10:00:00Z"
+}
