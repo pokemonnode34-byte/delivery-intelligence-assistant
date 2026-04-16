@@ -1,0 +1,1774 @@
+# Phase 2 — Project State Engine (Authoritative Spec v1.1 — FROZEN)
+
+## Document Purpose
+
+This document is the authoritative instruction set for Phase 2 of the AI Delivery Intelligence Assistant project. It is written for an LLM coder that will implement each step sequentially. Every step includes precise requirements, expected file outputs, acceptance criteria, a definition of done, a validation command checklist, and a development status tracker.
+
+This document also includes the complete LLM Coder Operating Manual: the Error Handling Philosophy, Step Verification Protocol, Silent Error Prevention Policy, and all Coder Guardrails. These policies apply to every step in every phase. They are included here so the LLM coder has a single, self-contained reference.
+
+**Do not skip steps. Do not reorder steps. Each step depends on the one before it.**
+
+---
+
+## Revision History
+
+| Version | Date | Changes |
+|---|---|---|
+| v1.0 | 2026-04-16 | Initial specification |
+| v1.1 | 2026-04-16 | Scope fix (BLOCKS/BLOCKED_BY removed), import-policy clarified, metadata init via `__post_init__`, webhook now updates `last_updated_at` and re-runs consistency, `StateCompleteness.STALE` removed, normalizer raise contract clarified, misc consistency fixes. |
+
+---
+
+## Phase 1 Dependency
+
+Phase 2 assumes Phase 1 is `COMPLETE`. The following Phase 1 artifacts are used directly. The LLM coder MUST verify every interface listed here against the actual source files before writing any Phase 2 code. Do not rely on memory — read the files.
+
+### Phase 1 Interface Reference (Authoritative)
+
+**`FetchResult`** — defined in `src/delivery_intelligence/gitlab/fetchers.py`
+
+```python
+@dataclass
+class FetchResult:
+    items: list[BaseEntity]       # homogeneous list — type determined by fetcher used
+    failures: int                  # count of records dropped during mapping
+    total_raw: int                 # total records received from API before mapping
+    failure_details: list[str]     # one human-readable string per dropped record
+```
+
+**`GitLabFetcher`** — defined in `src/delivery_intelligence/gitlab/fetchers.py`
+
+```python
+# Constructor
+GitLabFetcher(client, rate_limiter, retry_config, per_page)
+
+# Key methods Phase 2 uses:
+async def fetch_all_project_data(self, project_id: int) -> dict[str, Any]
+# Returns dict with keys: "project", "issues", "merge_requests",
+# "pipelines", "milestones", "contributors"
+# Values: "project" is a Project instance (or None if fetch failed),
+# all others are FetchResult instances.
+# Failed fetches return empty FetchResult(items=[], failures=0, total_raw=0, failure_details=[])
+
+async def fetch_project(self, project_id: int) -> Project
+# Raises GitLabNotFoundError on 404. Single entity — no FetchResult.
+
+async def fetch_issues(self, project_id: int, state=None, updated_after=None) -> FetchResult
+async def fetch_merge_requests(self, project_id: int, state=None, updated_after=None) -> FetchResult
+async def fetch_pipelines(self, project_id: int, ref=None, updated_after=None) -> FetchResult
+async def fetch_milestones(self, project_id: int, state=None) -> FetchResult
+async def fetch_contributors(self, project_id: int) -> FetchResult
+```
+
+**`WebhookPayload`** — defined in `src/delivery_intelligence/gitlab/webhooks.py`
+
+```python
+@dataclass
+class WebhookPayload:
+    event_type: WebhookEvent       # ISSUE | MERGE_REQUEST | PIPELINE | PUSH | NOTE | UNKNOWN
+    project_id: int
+    raw: dict[str, Any]            # original payload dict
+    received_at: datetime          # UTC timestamp of webhook arrival
+    entity_updated_at: datetime | None  # updated_at from payload data — authoritative state timestamp
+```
+
+**`WebhookEvent`** enum — defined in `src/delivery_intelligence/gitlab/webhooks.py`
+
+```python
+class WebhookEvent(str, Enum):
+    ISSUE = "Issue Hook"
+    MERGE_REQUEST = "Merge Request Hook"
+    PIPELINE = "Pipeline Hook"
+    PUSH = "Push Hook"
+    NOTE = "Note Hook"
+    UNKNOWN = "Unknown"
+```
+
+**`map_webhook_to_model()`** — defined in `src/delivery_intelligence/gitlab/webhooks.py`
+
+```python
+def map_webhook_to_model(payload: WebhookPayload) -> BaseEntity | None
+# Returns None for: PUSH, NOTE, UNKNOWN (non-error — no domain model for these)
+# Returns mapped entity for: ISSUE, MERGE_REQUEST, PIPELINE
+# Raises ValueError for mapped types with malformed payloads
+```
+
+**`Container`** — defined in `src/delivery_intelligence/core/container.py`
+
+```python
+# Phase 1 accessors (all require _initialized=True or raise RuntimeError):
+def get_settings() -> AppSettings        # works before initialize()
+def get_auth() -> GitLabAuth             # requires initialized
+def get_logger(name: str) -> BoundLogger # requires initialized
+def get_gitlab_client() -> GitLabClient  # requires initialized
+def get_fetcher() -> GitLabFetcher       # requires initialized
+def get_rate_limiter() -> RateLimiter    # requires initialized
+def get_work_item_detector() -> WorkItemDetector  # requires initialized
+async def detect_work_items(project_id: int) -> WorkItemMode
+async def shutdown() -> None             # MUST be awaited
+```
+
+**Phase 0 Domain Models** — defined in `src/delivery_intelligence/models/`
+
+Verify exact field names before using them. Key fields Phase 2 accesses:
+
+```python
+# Issue (models/issue.py)
+issue.id: int              # GitLab global issue ID — use this as dict key
+issue.iid: int             # project-internal issue number — do NOT use as dict key
+issue.project_id: int
+issue.state: EntityStatus  # OPEN | CLOSED
+issue.milestone_id: int | None
+issue.assignee_ids: list[int]
+issue.author_id: int
+issue.updated_at: UTCDatetime
+issue.closed_at: UTCDatetime | None
+
+# MergeRequest (models/merge_request.py)
+mr.id: int
+mr.iid: int
+mr.project_id: int
+mr.state: EntityStatus     # OPEN | CLOSED | MERGED | LOCKED
+mr.milestone_id: int | None
+mr.pipeline_id: int | None
+mr.assignee_ids: list[int]
+mr.reviewer_ids: list[int]
+mr.target_branch: str
+mr.updated_at: UTCDatetime
+
+# Pipeline (models/pipeline.py)
+pipeline.id: int
+pipeline.project_id: int
+pipeline.ref: str
+pipeline.status: PipelineStatus
+pipeline.updated_at: UTCDatetime
+
+# Milestone (models/milestone.py)
+milestone.id: int
+milestone.iid: int
+milestone.project_id: int
+milestone.state: MilestoneState  # ACTIVE | CLOSED
+milestone.due_date: date | None
+milestone.updated_at: UTCDatetime
+
+# Contributor (models/contributor.py)
+contributor.id: int
+contributor.username: str
+contributor.is_active: bool
+# CRITICAL: Contributor has NO updated_at field.
+# Do not attempt to access contributor.updated_at anywhere in Phase 2.
+
+# Project (models/project.py)
+project.id: int
+project.name: str
+project.path_with_namespace: str
+project.updated_at: UTCDatetime
+```
+
+**`BaseEntity`** — defined in `src/delivery_intelligence/models/base.py`
+- Config: `from_attributes=True`, `populate_by_name=True`, `frozen=True`
+- All domain models inherit from `BaseEntity`
+- Mutation via `model.model_copy(update={...})` only — never direct attribute assignment
+
+**`EntityStatus`** enum: `OPEN`, `CLOSED`, `MERGED`, `LOCKED`, `IN_PROGRESS`, `BLOCKED`
+
+**`PipelineStatus`** enum: `CREATED`, `WAITING_FOR_RESOURCE`, `PREPARING`, `PENDING`, `RUNNING`, `SUCCESS`, `FAILED`, `CANCELED`, `SKIPPED`, `MANUAL`, `SCHEDULED`
+
+**`MilestoneState`** enum: `ACTIVE`, `CLOSED`
+
+**If any Phase 1 artifact is missing, broken, or incomplete, Phase 2 cannot proceed. Verify Phase 1 completion first.**
+
+---
+
+## Pre-Implementation Protocol (MANDATORY)
+
+Before writing any code in any Phase 2 step, the LLM coder MUST execute the following file reads using the view tool. This is not optional. Skipping this and relying on memory is a defect.
+
+For every step, before writing the first line of implementation:
+
+```
+REQUIRED READS:
+1. src/delivery_intelligence/gitlab/fetchers.py
+   Verify: FetchResult fields, fetch_all_project_data() return dict keys,
+   GitLabFetcher constructor params.
+
+2. src/delivery_intelligence/gitlab/webhooks.py
+   Verify: WebhookPayload fields, WebhookEvent enum values,
+   map_webhook_to_model() return semantics.
+
+3. src/delivery_intelligence/core/container.py
+   Verify: all accessor method names, _initialized guard pattern,
+   shutdown() is async.
+
+4. src/delivery_intelligence/models/issue.py
+   src/delivery_intelligence/models/merge_request.py
+   src/delivery_intelligence/models/pipeline.py
+   src/delivery_intelligence/models/milestone.py
+   src/delivery_intelligence/models/contributor.py
+   src/delivery_intelligence/models/project.py
+   Verify: exact field names before accessing them in any Phase 2 code.
+
+5. src/delivery_intelligence/models/base.py
+   Verify: BaseEntity config (frozen=True), EntityStatus values, UTCDatetime type.
+```
+
+Any interface discrepancy between this document and the actual source files must be resolved by trusting the source files. Document the discrepancy as an `# ASSUMPTION:` comment and note it in the verification report.
+
+---
+
+## Phase 2 Overview
+
+**Goal:** Build and maintain a structured, queryable, relationship-aware, consistency-validated in-memory project state that all downstream phases (3–11) will read from exclusively.
+
+**What this phase produces:**
+
+- A set of state-specific data models: `ProjectState`, `StateMetadata`, `EntityRelationship`, `RelationshipIndex`, `IngestSummary`, `UpdateResult`, `ConsistencyIssue`, `ConsistencyReport`, and supporting enums
+- A `StateNormalizer` that converts `FetchResult` instances into typed state collections
+- A `ProjectStateStore` — the central in-memory repository with per-project async locking and a rich query interface for downstream phases
+- A `RelationshipTracker` that extracts and indexes entity relationships: issue→milestone, merge_request→milestone, merge_request→pipeline, issue/merge_request→contributor (assigned_to), merge_request→contributor (reviewed_by)
+- A `StateManager` that orchestrates full project refresh using Phase 1 fetchers
+- A `ConsistencyChecker` that validates state integrity after every load or update
+- Incremental state updates driven by Phase 1 webhook events, with timestamp-ordered conflict resolution
+- Container registration of all Phase 2 components as new dependencies
+
+**What this phase does NOT produce:**
+
+- No time-series tracking or velocity computation (that is Phase 3)
+- No risk scoring or delivery probability (that is Phase 5)
+- No dependency graph or critical path analysis (that is Phase 4)
+- No LLM integration (that is Phase 8)
+- No external database persistence — state is in-memory only
+- No Redis, no file-based caching, no SQLite writes
+- No direct GitLab API calls — all data flows through Phase 1 via Container
+- No modifications to Phase 0 domain models
+
+---
+
+## Anti-Drift Rules
+
+The LLM coder must not introduce anything outside the defined scope. Specifically:
+
+1. **Do not make direct GitLab API calls.** Phase 2 MUST NOT import runtime behavior from any `delivery_intelligence.gitlab` module except `webhooks.py`. Type-only imports of `GitLabFetcher` (guarded by `if TYPE_CHECKING:`) are permitted in `engines/state/manager.py` solely for annotating method signatures. Phase 2 must not instantiate or discover `GitLabFetcher` itself. A fetcher instance may be passed in by the caller, and `StateManager` may invoke only the approved fetch methods on that injected instance. All actual fetching flows through the injected fetcher. Violation of Invariant 4 is a critical defect.
+2. **Do not implement time-series logic.** No velocity, no trend detection, no change rate computation. That is Phase 3.
+3. **Do not implement risk scoring.** No probability scores, no risk signals. That is Phase 5.
+4. **Do not build a dependency graph.** No critical path, no cascade detection. That is Phase 4.
+5. **Do not add external persistence.** State lives in memory only.
+6. **Do not modify Phase 0 domain models.** If a field is missing, document the gap — do not silently add it.
+7. **Do not add frameworks not in the Technology Stack.** No SQLAlchemy, no NetworkX, no FastAPI.
+8. **Do not add synchronous wrappers around async state operations.**
+9. **Do not rename modules, restructure directories, or deviate from the defined project layout.**
+10. **Do not create utility modules, helper files, or "common" packages** not listed in the directory structure.
+11. **Do not cache API responses.** Phase 2 holds only normalized domain entities, not raw JSON.
+12. **Do not introduce generic `FetchResult[T]`** unless explicitly required.
+
+If a step does not mention it, do not build it.
+
+---
+
+## Technology Stack (Phase 2 Additions)
+
+Phase 2 adds no new production dependencies. It uses:
+
+- The full Phase 0/1 stack (Python 3.11+, Pydantic v2, structlog, python-dotenv)
+- `asyncio` stdlib — `asyncio.Lock` for per-project write safety, `asyncio.gather` for concurrent refresh
+- Python `dataclasses` stdlib — Phase 2 state models are mutable dataclasses, not frozen Pydantic models
+- Python `datetime` stdlib — `datetime.now(timezone.utc)` for all timestamp generation
+
+No new entries in `pyproject.toml`.
+
+---
+
+## Development Status Legend
+
+| Status | Meaning |
+|---|---|
+| `NOT_STARTED` | Work has not begun |
+| `IN_PROGRESS` | Implementation is underway |
+| `VERIFYING` | Code written, tests passing — self-verification loop active |
+| `COMPLETE` | Code verified, tests passing, lint clean, no major/medium issues remaining |
+| `BLOCKED` | Cannot proceed — dependency or issue documented |
+| `NEEDS_REVIEW` | Code written but requires human review |
+
+### Step Lifecycle
+
+```
+NOT_STARTED → IN_PROGRESS → [tests pass] → VERIFYING → [0 MAJOR, 0 MEDIUM] → COMPLETE
+```
+
+---
+
+## File Ownership Boundaries
+
+Phase 2 populates `engines/state/`. All Phase 0/1 boundaries remain enforced.
+
+| Package | Owns | Does NOT Own |
+|---|---|---|
+| `engines/state/` | State models, store, normalizer, relationship tracker, state manager, consistency checker | Domain model definitions, GitLab API calls, time-series, risk scoring |
+| `core/` | Container (extended with state component registration) | State logic |
+| `models/` | Domain entities (unchanged from Phase 0) | State containers, relationship indexes |
+| `gitlab/` | API client and ingestion (unchanged from Phase 1) | State logic |
+
+### Import Dependency Direction within `engines/state/`
+
+```
+models.py          <- nothing (within engines/state/)
+normalizer.py      <- engines/state/models
+relationships.py   <- engines/state/models
+store.py           <- engines/state/models
+consistency.py     <- engines/state/models, engines/state/store
+manager.py         <- engines/state/models, engines/state/store,
+                      engines/state/normalizer, engines/state/relationships,
+                      engines/state/consistency, gitlab/webhooks (for map_webhook_to_model)
+```
+
+Cross-package allowed:
+- `engines/state/` -> `models/` (Phase 0 domain models — read only)
+- `engines/state/manager.py` -> `gitlab/webhooks.py` (map_webhook_to_model, WebhookPayload only — runtime import)
+- `engines/state/manager.py` -> `gitlab/fetchers.GitLabFetcher` (TYPE_CHECKING-only import, for signature annotation)
+- `core/container.py` -> `engines/state/` (for registration)
+
+Cross-package PROHIBITED:
+- `engines/state/` -> `gitlab/client.py`, `gitlab/fetchers.py` (runtime), `gitlab/rate_limiter.py`, `gitlab/retry.py`, `gitlab/pagination.py`
+- `engines/state/` -> `config/`
+- `models/` -> `engines/state/`
+
+---
+
+## Definition of Done (applies to every step)
+
+A step is `COMPLETE` only when ALL of the following are true:
+
+1. All code for the step is written and saved.
+2. All tests for the step are written and saved.
+3. All tests pass: `pytest {test_path} -v`
+4. No import errors: `python -c "import delivery_intelligence"`
+5. No lint errors: `ruff check src/ tests/`
+6. Type checking passes: `mypy src/delivery_intelligence/{module}`
+7. All Phase 0 and Phase 1 tests still pass: `pytest tests/ -v`
+8. **Step has passed the Verification Protocol with 0 MAJOR and 0 MEDIUM issues.**
+9. Status table is updated to `COMPLETE` with the current date.
+
+---
+
+## Directory Structure (Phase 2 Target)
+
+```
+src/delivery_intelligence/
+└── engines/
+    ├── __init__.py
+    └── state/
+        ├── __init__.py
+        ├── models.py
+        ├── normalizer.py
+        ├── store.py
+        ├── relationships.py
+        ├── consistency.py
+        └── manager.py
+
+tests/
+├── test_engines/
+│   ├── __init__.py
+│   └── test_state/
+│       ├── __init__.py
+│       ├── conftest.py
+│       ├── test_models.py
+│       ├── test_normalizer.py
+│       ├── test_store.py
+│       ├── test_relationships.py
+│       ├── test_consistency.py
+│       ├── test_manager.py
+│       └── test_integration.py
+└── fixtures/
+    └── state/
+        ├── project_state_full.json
+        └── project_state_partial.json
+```
+
+---
+
+## Canonical Terminology (LOCKED)
+
+| Concept | Canonical | Prohibited |
+|---|---|---|
+| Top-level per-project state container | `ProjectState` | `ProjectData`, `ProjectSnapshot`, `ProjectRecord` |
+| In-memory state repository | `ProjectStateStore` | `StateRepository`, `StateCache`, `StateDB` |
+| State operations orchestrator | `StateManager` | `StateOrchestrator`, `StateController`, `StateService` |
+| FetchResult to state conversion | `StateNormalizer` | `StateBuilder`, `StateMapper`, `StateFactory` |
+| Typed edge between two entities | `EntityRelationship` | `EntityLink`, `EntityEdge`, `EntityConnection` |
+| Bidirectional relationship lookup | `RelationshipIndex` | `RelationshipGraph`, `RelationshipMap` |
+| Relationship extraction logic | `RelationshipTracker` | `RelationshipExtractor`, `RelationshipBuilder` |
+| Post-load state validation | `ConsistencyChecker` | `StateValidator`, `StateAuditor` |
+| Result of webhook application | `UpdateResult` | `ApplyResult`, `EventResult`, `WebhookResult` |
+| Result of full refresh | `IngestSummary` | `RefreshResult`, `LoadSummary`, `FetchSummary` |
+| State freshness indicator | `StateCompleteness` | `StateStatus`, `StateFreshness`, `DataQuality` |
+| Entity ID dict key | `entity.id` | `entity.iid` (iid is project-internal only) |
+
+---
+
+## Architectural Invariants
+
+### Invariant 1 — Store Is the Single Source of Truth
+
+All downstream phases (3–11) MUST read project state exclusively through `ProjectStateStore`. No downstream phase may import or call `GitLabFetcher` directly.
+
+### Invariant 2 — Entity Immutability Preserved
+
+Phase 0 domain models are `frozen=True`. Phase 2 never mutates Phase 0 domain models. Stored references are replaced with a fresh instance, whether newly mapped or created via `model.model_copy(update={...})`.
+
+### Invariant 3 — Timestamp-Ordered Updates
+
+When applying incremental webhook updates:
+- If `payload.entity_updated_at is not None` AND `stored_entity exists` AND `payload.entity_updated_at <= stored_entity.updated_at`: discard, log DEBUG, return `UpdateResult(applied=False, reason="stale_event_discarded")`.
+- If `payload.entity_updated_at is None`: skip the guard and apply the update.
+
+### Invariant 4 — No Direct GitLab API Access
+
+Phase 2 modules MUST NOT perform runtime imports from `gitlab/client`, `gitlab/fetchers`, `gitlab/rate_limiter`, `gitlab/retry`, or `gitlab/pagination`. Type-only imports guarded by `if TYPE_CHECKING:` are permitted for `GitLabFetcher` in `engines/state/manager.py` to support signature annotations. The only permitted runtime `gitlab/` import is `gitlab/webhooks` (for `WebhookPayload`, `WebhookEvent`, and `map_webhook_to_model`).
+
+### Invariant 5 — Completeness Is Always Known and Always Honest
+
+`StateMetadata.completeness` is always set. It must never be `FULL` unless a complete, uninterrupted full refresh completed with zero fetch failures and a non-None project entity. Only the full-refresh path may result in `FULL`, and in practice this is enforced by `StateManager.refresh_project()` using the normalizer's output.
+
+---
+
+## Error Handling Philosophy
+
+Carried forward from Phase 1. Fully in effect.
+
+### The Hard Rule
+
+**When in doubt: raise. It is always safer to surface an error loudly than to hide it quietly.**
+
+### Fail-Fast Conditions for Phase 2
+
+| Condition | Reason |
+|---|---|
+| Container accessed before `initialize()` | Programming error |
+| `store.update_entity()` called for untracked project | State corruption risk |
+| `StateManager` constructed without required dependencies | Invalid object state |
+| `ProjectState` stored with mismatched `project_id` | Silent data corruption |
+| Invariant 4 violated | Architectural contract broken |
+| `normalize_project_data()` receives non-dict or empty input | Input contract violated |
+
+### Fail-Soft Conditions for Phase 2
+
+| Condition | Reason |
+|---|---|
+| One FetchResult with failures > 0 | Mark PARTIAL, continue |
+| One entity fails relationship extraction | Other relationships still valid |
+| One project fails in concurrent refresh | Other projects independent |
+| Orphaned reference in ConsistencyChecker | Warning, not blocking |
+| Webhook for untracked project | Return UpdateResult(applied=False) — not an error |
+
+### Every Failure Must Produce Two Signals
+
+1. A structured log entry at `WARNING` or `ERROR`.
+2. A caller-visible signal — exception (fail-fast) or failure-tracking return type (fail-soft).
+
+---
+
+# LLM CODER OPERATING MANUAL
+
+---
+
+## Step Verification Protocol
+
+### Issue Severity Classification
+
+**MAJOR — Must fix before proceeding.**
+- Stale webhook applied instead of discarded (violates Invariant 3)
+- FetchResult items silently dropped without counting in IngestSummary
+- Write to `_states` without acquiring per-project lock
+- Contract violation: wrong return type
+- Broken Invariant 4: import from `gitlab/fetchers.py`
+- `StateCompleteness.FULL` set when failures exist
+- Any silent failure
+
+**MEDIUM — Must fix before proceeding.**
+- Entity dict keyed by `entity.iid` instead of `entity.id`
+- Missing edge case: `Contributor` treated as having `updated_at`
+- Incomplete extraction: `reviewer_ids` ignored in MR relationship extraction
+- Log statement missing `project_id` or `entity_type`
+- Test asserting `assert summary.entities_loaded` without verifying specific counts
+
+**MINOR — Note but do not fix in this loop.**
+Style, naming, documentation issues that do not affect correctness.
+
+### Verification Checklist
+
+**1. Contract Compliance** — signature matches spec, docstring fulfilled, acceptance criteria met, all 5 invariants respected.
+
+**2. Error Handling** — failure modes handled, structured log format (no f-strings), fail-fast vs fail-soft followed.
+
+**3. Edge Cases** — empty FetchResult, all fetch failures, webhook for untracked project, `entity_updated_at=None`, `Contributor` with no timestamp.
+
+**4. Async Correctness** — all awaits present, per-project lock on every write, `asyncio.gather(return_exceptions=True)` with explicit exception handling.
+
+**5. Security** — no secrets in logs or repr.
+
+**6. Test Quality** — meaningful assertions (not just "no exception"), edge cases covered, async tests decorated, fresh store per test, no real API calls.
+
+**7. Integration Fit** — imports non-circular, ownership boundaries respected, symbols exported in `__init__.py`.
+
+**8. Silent Error Detection**
+- Any bare `except: pass` block?
+- Any normalizer that returns without surfacing failure count?
+- Any `asyncio.gather` result where exceptions are silently discarded?
+- `StateCompleteness.FULL` set when failures exist? **CRITICAL defect.**
+- Any `UpdateResult(applied=False)` returned without a log entry?
+
+**If ANY check in category 8 fails, it is a CRITICAL defect that blocks the step.**
+
+### Verification Pass Procedure
+
+1. Set status to `VERIFYING (N/5)`.
+2. Re-read full step code from files.
+3. Walk checklist. Each category: PASS or ISSUE(S) FOUND.
+4. Report:
+   ```
+   Verification Pass #N:
+   - MAJOR: [count] — [one-line each]
+   - MEDIUM: [count] — [one-line each]
+   - MINOR: [count] — [noted]
+   - Verdict: PASS / NEEDS_FIX
+   ```
+5. NEEDS_FIX: fix, re-run, new pass. PASS: set COMPLETE.
+
+### Loop Termination
+
+| Condition | Action |
+|---|---|
+| 0 MAJOR and 0 MEDIUM | COMPLETE |
+| 5 iterations reached | NEEDS_REVIEW with issues documented |
+| Fix introduces new MAJOR | New iteration |
+| Tests fail after fix | Fix first, then re-verify |
+
+---
+
+## Silent Error Prevention Policy
+
+### Zero-Tolerance Rule
+
+Silent failures are CRITICAL defects. Every failure produces TWO signals: log + caller-visible signal.
+
+### Banned Patterns
+
+```python
+# BANNED 1 — silent drop
+for item in result.items:
+    try:
+        entity_map[item.id] = cast(Issue, item)
+    except Exception:
+        pass
+
+# BANNED 2 — UpdateResult without log
+except ValueError:
+    return UpdateResult(..., applied=False, reason="mapping_failed")
+
+# BANNED 3 — FULL despite failures
+state.metadata.completeness = StateCompleteness.FULL  # when failures > 0
+
+# BANNED 4 — gather without exception handling
+results = await asyncio.gather(*tasks, return_exceptions=True)
+states = [r for r in results if isinstance(r, ProjectState)]
+```
+
+### Required Patterns
+
+**Pattern A — Normalizer with failure tracking:**
+```python
+def _normalize_entity_result(
+    self,
+    result: FetchResult | None,
+    entity_type: str,
+    project_id: int,
+) -> tuple[dict[int, BaseEntity], list[str]]:
+    """Converts FetchResult items to id-keyed dict. Never raises.
+    Returns (entity_map, dropped_details) where dropped_details
+    carries forward FetchResult.failure_details."""
+    if result is None:
+        logger.warning("missing_fetch_result", entity_type=entity_type, project_id=project_id)
+        return {}, [f"{entity_type}: fetch result missing"]
+    entity_map: dict[int, BaseEntity] = {}
+    for item in result.items:
+        entity_map[item.id] = item
+    return entity_map, list(result.failure_details)
+```
+
+**Pattern B — UpdateResult with mandatory log on failure:**
+```python
+except ValueError as e:
+    logger.error(
+        "webhook_entity_mapping_failed",
+        project_id=payload.project_id,
+        event_type=payload.event_type.value,
+        error_type=type(e).__name__,
+        error=str(e),
+    )
+    return UpdateResult(
+        project_id=payload.project_id,
+        entity_type="unknown",
+        entity_id=0,
+        applied=False,
+        reason="mapping_failed",
+        source=UpdateSource.WEBHOOK,
+    )
+```
+
+**Pattern C — Guarded concurrent refresh:**
+```python
+results = await asyncio.gather(*tasks, return_exceptions=True)
+summaries: dict[int, IngestSummary] = {}
+for pid, result in zip(project_ids, results):
+    if isinstance(result, Exception):
+        logger.error(
+            "project_refresh_failed",
+            project_id=pid,
+            error_type=type(result).__name__,
+            error=str(result),
+        )
+        summaries[pid] = IngestSummary(
+            project_id=pid,
+            source=UpdateSource.FULL_REFRESH,
+            started_at=started_at,
+            completed_at=datetime.now(timezone.utc),
+            entities_loaded={},
+            entities_failed={"refresh": 1},
+            dropped_records=[f"refresh_failed: {result}"],
+            relationships_extracted=0,
+            consistency_issues=0,
+        )
+    else:
+        summaries[pid] = result
+return summaries
+```
+
+---
+
+## LLM Coder Guardrails
+
+### Category 1 — Code Integrity
+**1.1** No Phantom Implementations. Every spec bullet point implemented. Mismatch = MAJOR.
+**1.2** No Docstring-Code Drift. Docstring updates with code changes.
+**1.3** No Copy-Paste Adaptation Failures. Verify every adapted element.
+**1.4** No Invented Interfaces. Verify against actual source files.
+
+### Category 2 — Type Safety
+**2.1** No ID Confusion. Key dicts by `entity.id` (global), never `entity.iid` (project-internal).
+**2.2** No Untyped Containers. `dict[int, Issue]` not `dict`. `list[EntityRelationship]` not `list`.
+**2.3** No `Any` Escape Hatch. `Any` only for raw JSON from `fetch_all_project_data()` return.
+
+### Category 3 — Test Quality
+**3.1** No Tautological Tests. `assert len(state.issues) == 3` not `assert state.issues`.
+**3.2** No Happy-Path-Only Tests. At least 1 error/edge case per 2 happy-path tests.
+**3.3** No Real API Calls. Mock `GitLabFetcher` via `unittest.mock.AsyncMock`.
+**3.4** No `Contributor.updated_at` Access. This field does not exist.
+
+### Category 4 — Async Discipline
+**4.1** No Missing Awaits. Every `store.store_state()`, `store.update_entity()`, `manager.refresh_project()`, `manager.apply_webhook_event()` must be awaited.
+**4.2** No Lock Bypass. Every write to `_states[project_id]` inside acquired per-project lock.
+**4.3** No Sync Calls in Async Context.
+
+### Category 5 — Naming and Consistency
+**5.1** Apply canonical terminology table. Every synonym is a defect.
+**5.2** `snake_case` past tense for log events: `state_refresh_completed`, `entity_updated`, `stale_event_discarded`.
+
+### Category 6 — State Integrity
+**6.1** No Unguarded State Writes. Always acquire per-project lock.
+**6.2** No Input Mutation. Create new instances; never mutate Phase 0 models.
+**6.3** No Completeness Upgrade via Webhook. Webhooks never set `StateCompleteness.FULL`.
+
+### Category 7 — Spec Compliance
+**7.1** `# ASSUMPTION:` prefix for any interpretation. Grep-able.
+**7.2** No Forward References. Step N uses only Steps 1..N-1 and Phase 0/1 artifacts.
+**7.3** No Gratuitous Abstraction.
+
+### Category 8 — Defensive Coding
+**8.1** `if value is not None:` not `if value:`.
+**8.2** `state.issues.get(issue_id)` not `state.issues[issue_id]` when key may not exist.
+**8.3** `isinstance(result, FetchResult)` before accessing `.items`.
+
+### Category 9 — Context and Memory
+**9.1** Re-read Invariants, step spec, and imported module interfaces from files before coding.
+**9.2** Verify exact names from source files, not memory.
+
+### Category 10 — Regression Prevention
+**10.1** Read entire function before modifying.
+**10.2** `grep -r "function_name" src/ tests/` before changing any signature.
+**10.3** Zero test failures tolerated across all phases.
+
+### Category 11 — Import Hygiene
+**11.1** No circular imports. Follow ownership boundary directions.
+**11.2** No wrong-direction dependencies. Invariant 4 enforced.
+**11.3** No unused imports.
+
+### Category 12 — Log Level Semantics
+
+| Level | Use When |
+|---|---|
+| `DEBUG` | Stale event discarded, lock acquired, cache details |
+| `INFO` | Refresh started/completed (with counts), container registration, entity updated |
+| `WARNING` | Partial completeness set, orphaned reference, missing fetch result key |
+| `ERROR` | Entity normalization failed, webhook mapping failed, project refresh failed |
+| `CRITICAL` | Container state corruption, Invariant 4 violation at runtime |
+
+### Category 13 — Temporal Coupling
+**13.1** Container manages init order. `StateManager` unusable before container initialized.
+**13.2** All `datetime.now(timezone.utc)` at call time, never import time.
+
+### Category 14 — Dead Code
+**14.1** No dead code. Every function called, every variable read.
+**14.2** Defend external inputs. Trust type system for internal contracts.
+
+### Category 15 — Dataclass Discipline
+**15.1** Every `list`/`dict` field uses `field(default_factory=...)`. Never `= []` or `= {}`.
+**15.2** No `frozen=True` on Phase 2 state models. State must be updatable.
+
+### Category 16 — Exception Chain Discipline
+**16.1** Always `raise X from e`. Never lose the traceback.
+**16.2** No bare `except`. Specific types only. `except Exception` only at gather boundaries.
+
+### Category 17 — Test Isolation
+**17.1** Fresh `ProjectStateStore` instance per test via fixture.
+**17.2** Every test passes when run alone.
+**17.3** No time-dependent tests.
+
+### Category 18 — Memory Bounds
+**18.1** Store holds all tracked projects for container lifetime. Shutdown clears all.
+**18.2** Phase 2 stores current entity state only. No history accumulation — that is Phase 3.
+
+### Category 19 — Container Integration
+**19.1** `StateManager`, `ProjectStateStore` etc. instantiated only inside `container.initialize()`.
+**19.2** Post-shutdown access raises `RuntimeError`.
+
+### Category 20 — Python Version
+**20.1** Python 3.11+ only. No `type` statement (3.12+). Use `TypeAlias`.
+
+---
+
+## Step-by-Step Implementation
+
+---
+
+### Step 1 — Define State Domain Models
+
+> **Status: `NOT_STARTED`**
+
+#### Pre-Step Required Reads
+
+- `src/delivery_intelligence/models/base.py` — verify `BaseEntity`, `EntityStatus`, `UTCDatetime`
+- `src/delivery_intelligence/models/contributor.py` — confirm NO `updated_at` field
+
+#### Objective
+
+Define all Phase 2-specific data models as mutable Python dataclasses. Not Pydantic models. These are state containers that reference Phase 0 frozen domain entities as values.
+
+#### Instructions
+
+1. Create `src/delivery_intelligence/engines/__init__.py` (empty).
+
+2. Create `src/delivery_intelligence/engines/state/__init__.py` (empty — populated with exports in Step 7).
+
+3. Create `src/delivery_intelligence/engines/state/models.py` containing:
+
+   **Enums (all extend `str, Enum`):**
+
+   **`StateCompleteness`:**
+   - `FULL` — complete uninterrupted refresh with zero fetch failures and non-None project.
+   - `PARTIAL` — refresh with at least one `FetchResult.failures > 0`, or project entity was None, or state updated only via webhooks and never fully refreshed.
+   - `EMPTY` — no entities in state. Refresh has not run.
+
+   **`StateHealth`:**
+   - `HEALTHY` — state is FULL, no ERROR consistency issues.
+   - `DEGRADED` — state is PARTIAL, or WARNING/ERROR consistency issues exist.
+   - `STALE` — state not refreshed within threshold.
+   - `UNKNOWN` — state has never been refreshed (completeness is EMPTY).
+
+   **`RelationshipType`:**
+   - `BELONGS_TO_MILESTONE` — source entity (issue or merge_request) belongs to target milestone
+   - `ASSIGNED_TO` — source entity (issue or merge_request) assigned to target contributor
+   - `TRIGGERS_PIPELINE` — source merge_request triggers target pipeline
+   - `REVIEWED_BY` — source merge_request reviewed by target contributor
+
+   Note: issue-to-issue dependency relationships (blocks / blocked_by) are intentionally
+   out of scope for Phase 2. No Phase 0 domain field sources them. They belong to Phase 4
+   (Dependency Graph) and MUST NOT be added here.
+
+   **`UpdateSource`:**
+   - `FULL_REFRESH` — state set by complete fetch via `StateManager.refresh_project()`
+   - `WEBHOOK` — entity updated via `StateManager.apply_webhook_event()`
+   - `INCREMENTAL_FETCH` — reserved for Phase 3+ (not used in Phase 2)
+
+   **Dataclasses (all use `field(default_factory=...)` for list/dict fields):**
+
+   **`EntityRelationship`:**
+   ```python
+   @dataclass
+   class EntityRelationship:
+       source_type: str    # "issue", "merge_request", "pipeline", "milestone", "contributor"
+       source_id: int      # entity.id (global GitLab ID)
+       target_type: str
+       target_id: int
+       relationship_type: RelationshipType
+       project_id: int
+   ```
+
+   **`RelationshipIndex`:**
+   ```python
+   @dataclass
+   class RelationshipIndex:
+       by_source: dict[tuple[str, int], list[EntityRelationship]] = field(default_factory=dict)
+       by_target: dict[tuple[str, int], list[EntityRelationship]] = field(default_factory=dict)
+       by_type: dict[RelationshipType, list[EntityRelationship]] = field(default_factory=dict)
+   ```
+   Methods:
+   - `get_relationships_from(entity_type: str, entity_id: int) -> list[EntityRelationship]` — returns `by_source.get((entity_type, entity_id), [])`.
+   - `get_relationships_to(entity_type: str, entity_id: int) -> list[EntityRelationship]` — returns `by_target.get((entity_type, entity_id), [])`.
+   - `get_by_type(rel_type: RelationshipType) -> list[EntityRelationship]` — returns `by_type.get(rel_type, [])`.
+   - `count() -> int` — `sum(len(v) for v in self.by_source.values())`.
+
+   **`StateMetadata`:**
+   ```python
+   @dataclass
+   class StateMetadata:
+       project_id: int
+       completeness: StateCompleteness = StateCompleteness.EMPTY
+       health: StateHealth = StateHealth.UNKNOWN
+       last_refresh_at: datetime | None = None
+       last_updated_at: datetime | None = None
+       entity_counts: dict[str, int] = field(default_factory=dict)
+       fetch_failures: int = 0
+   ```
+
+   **`IngestSummary`:**
+   ```python
+   @dataclass
+   class IngestSummary:
+       project_id: int
+       source: UpdateSource
+       started_at: datetime
+       completed_at: datetime
+       entities_loaded: dict[str, int]
+       entities_failed: dict[str, int]
+       dropped_records: list[str] = field(default_factory=list)
+       relationships_extracted: int = 0
+       consistency_issues: int = 0
+   ```
+
+   **`UpdateResult`:**
+   ```python
+   @dataclass
+   class UpdateResult:
+       project_id: int
+       entity_type: str
+       entity_id: int     # 0 if unknown (e.g., mapping failed before ID extraction)
+       applied: bool
+       reason: str
+       source: UpdateSource = UpdateSource.WEBHOOK
+   ```
+   Canonical `reason` values:
+   - `"applied"` — update applied successfully
+   - `"stale_event_discarded"` — incoming updated_at <= stored updated_at
+   - `"project_not_tracked"` — project_id not in store
+   - `"no_state_for_project"` — project tracked but state is None
+   - `"event_type_not_tracked"` — PUSH, NOTE, UNKNOWN
+   - `"mapping_failed"` — ValueError from map_webhook_to_model
+   - `"entity_not_in_state"` — entity type unrecognized
+
+   **`ConsistencyIssue`:**
+   ```python
+   @dataclass
+   class ConsistencyIssue:
+       severity: Literal["WARNING", "ERROR"]
+       check_name: str      # snake_case: "orphaned_milestone_reference", "stale_state", etc.
+       entity_type: str | None
+       entity_id: int | None
+       description: str
+       recommendation: str
+   ```
+
+   **`ConsistencyReport`:**
+   ```python
+   @dataclass
+   class ConsistencyReport:
+       project_id: int
+       generated_at: datetime
+       issues: list[ConsistencyIssue] = field(default_factory=list)
+       is_healthy: bool = True
+       # is_healthy = True unless there is at least one issue with severity="ERROR"
+       # WARNING issues do NOT make is_healthy=False
+   ```
+
+   Note: `ConsistencyReport.is_healthy` reflects only ERROR presence. `StateHealth` is broader 
+   and may be `DEGRADED` even when `is_healthy=True`, for example when warnings exist or 
+   completeness is PARTIAL.
+
+   **`ProjectState`:**
+   ```python
+   @dataclass
+   class ProjectState:
+       project_id: int
+       project: Project | None = None
+       issues: dict[int, Issue] = field(default_factory=dict)
+       merge_requests: dict[int, MergeRequest] = field(default_factory=dict)
+       pipelines: dict[int, Pipeline] = field(default_factory=dict)
+       milestones: dict[int, Milestone] = field(default_factory=dict)
+       contributors: dict[int, Contributor] = field(default_factory=dict)
+       relationship_index: RelationshipIndex = field(default_factory=RelationshipIndex)
+       metadata: StateMetadata = field(init=False)
+       
+       def __post_init__(self) -> None:
+           self.metadata = StateMetadata(project_id=self.project_id)
+   ```
+
+#### Design Rules
+
+- All Phase 2 state models are mutable Python dataclasses. NOT Pydantic models.
+- No `frozen=True` on any Phase 2 dataclass.
+- All list/dict fields use `field(default_factory=...)`. Never bare `= []` or `= {}`.
+- All timestamps use Python `datetime` (stdlib), not `UTCDatetime` (Pydantic type).
+
+#### Acceptance Criteria
+
+- All dataclasses instantiate with defaults.
+- `RelationshipIndex.get_relationships_from("issue", 1)` returns `[]` when empty.
+- `RelationshipIndex.count()` returns correct total.
+- `ConsistencyReport.is_healthy` is `False` only when an ERROR issue exists.
+- `UpdateResult.reason` matches a canonical value from the list above.
+- `ProjectState` correctly initializes `metadata.project_id` via `__post_init__`.
+
+#### Validation Commands
+
+```bash
+pytest tests/test_engines/test_state/test_models.py -v
+ruff check src/delivery_intelligence/engines/
+mypy src/delivery_intelligence/engines/state/models.py
+```
+
+#### Files Created or Modified
+
+- `src/delivery_intelligence/engines/__init__.py`
+- `src/delivery_intelligence/engines/state/__init__.py`
+- `src/delivery_intelligence/engines/state/models.py`
+- `tests/test_engines/__init__.py`
+- `tests/test_engines/test_state/__init__.py`
+- `tests/test_engines/test_state/test_models.py`
+
+---
+
+### Step 2 — Build State Normalizer
+
+> **Status: `NOT_STARTED`**
+
+#### Pre-Step Required Reads
+
+- `src/delivery_intelligence/gitlab/fetchers.py` — verify `FetchResult` fields and `fetch_all_project_data()` return dict keys
+- `src/delivery_intelligence/engines/state/models.py` — verify `ProjectState`, `StateMetadata`, `IngestSummary`, `StateCompleteness`, `UpdateSource` as written
+
+#### Objective
+
+Build the boundary layer between Phase 1 raw output (`FetchResult` instances) and Phase 2 structured state (`ProjectState`). The normalizer is stateless — it holds no state of its own.
+
+#### Instructions
+
+1. Create `src/delivery_intelligence/engines/state/normalizer.py` containing:
+
+   **`StateNormalizer` class:**
+
+   **`__init__(self) -> None`** — stateless. Logger via `get_logger("state.normalizer")`.
+
+   **`normalize_project_data(self, project_id: int, raw_data: dict[str, Any]) -> tuple[ProjectState, IngestSummary]`:**
+
+   Input validation: Raises `ValueError` if `raw_data` is not a dict or is empty.
+   All helper methods never raise.
+
+   Authoritative flow:
+   1. Record `started_at = datetime.now(timezone.utc)`.
+   2. Validate `raw_data` is a non-empty dict. Raise `ValueError` if not.
+   3. Validate `project_id > 0`. Raise `ValueError` if not.
+   4. Extract `project = raw_data.get("project")`. Accept `None` — log WARNING if so.
+   5. For each entity type (`"issues"`, `"merge_requests"`, `"pipelines"`, `"milestones"`, `"contributors"`): call `_normalize_entity_result(raw_data.get(key), entity_type, project_id)`. Missing key treated as `None` input to the helper.
+   6. Build `ProjectState` with extracted collections. Set `state.project_id = project_id`. (metadata auto-set via `__post_init__`).
+   7. Aggregate all `failure_details` from all entity types via `_aggregate_dropped_records()`.
+   8. Compute `total_fetch_failures = sum(result.failures for result in all fetch results if result is not None)`.
+   9. Compute `StateCompleteness`:
+      - `EMPTY` if all entity collections have zero items AND total_fetch_failures == 0.
+      - `FULL` if total_fetch_failures == 0 AND project is not None AND at least one collection is non-empty.
+      - `PARTIAL` otherwise.
+   10. Set `state.metadata.completeness`, `state.metadata.entity_counts`, `state.metadata.fetch_failures`.
+   11. Build `IngestSummary` with `entities_loaded` (counts of items), `entities_failed` (counts of failures per type), `dropped_records`, `completed_at = datetime.now(timezone.utc)`.
+   12. Log INFO: `state_normalized` with `project_id`, `entity_counts`, `total_failures`, `completeness`.
+   13. Return `(state, summary)`.
+
+   **`_normalize_entity_result(self, result: FetchResult | None, entity_type: str, project_id: int) -> tuple[dict[int, BaseEntity], list[str]]`:**
+   - Never raises.
+   - If `result is None`: log WARNING `missing_fetch_result` with `entity_type`, `project_id`. Return `({}, [f"{entity_type}: fetch result missing"])`.
+   - Build `entity_map: dict[int, BaseEntity] = {}`. Iterate `result.items`. Key each by `item.id`. On `AttributeError`: log ERROR, add to failure list, skip.
+   - Return `(entity_map, list(result.failure_details))`.
+
+   **`_compute_entity_counts(self, state: ProjectState) -> dict[str, int]`:**
+   - Returns `{"issues": len(state.issues), "merge_requests": len(state.merge_requests), "pipelines": len(state.pipelines), "milestones": len(state.milestones), "contributors": len(state.contributors)}`.
+
+   **`_aggregate_dropped_records(self, per_type_details: dict[str, list[str]]) -> list[str]`:**
+   - Prefixes each detail string: `f"{entity_type}: {detail}"`.
+   - Returns flat list.
+
+2. Create fixture files:
+   - `tests/fixtures/state/project_state_full.json` — complete project state matching Phase 0 field names. Include: 5 issues (mix OPEN/CLOSED), 3 MRs (mix OPEN/MERGED), 2 pipelines, 2 milestones, 3 contributors. At least 1 issue has `milestone_id`. At least 1 MR has `pipeline_id`.
+   - `tests/fixtures/state/project_state_partial.json` — same structure but `failures: 2` in issues with 2 `failure_details` entries.
+
+3. Create `tests/test_engines/test_state/conftest.py` with:
+   - `fresh_store` fixture: returns new `ProjectStateStore()` per test.
+   - `sample_project_id` fixture: returns `42`.
+   - `sample_fetch_result_issues` fixture: `FetchResult` with 3 valid `Issue` instances, `failures=0`.
+   - `sample_fetch_result_with_failures` fixture: `FetchResult` with 2 valid issues, `failures=1`, `failure_details=["Issue 99: ValueError: missing author_id"]`.
+   - `sample_raw_data` fixture: realistic `dict[str, Any]` matching `fetch_all_project_data()` output.
+
+4. Create `tests/test_engines/test_state/test_normalizer.py` covering:
+   - Valid normalization returns `(ProjectState, IngestSummary)`.
+   - Entity counts in `IngestSummary.entities_loaded` match input.
+   - `FetchResult.failure_details` propagated to `IngestSummary.dropped_records` with entity type prefix.
+   - Completeness is `FULL` when no failures and project not None.
+   - Completeness is `PARTIAL` when any FetchResult has `failures > 0`.
+   - Completeness is `PARTIAL` when project entity is None.
+   - Completeness is `EMPTY` when all collections empty and no failures.
+   - Missing key in `raw_data` handled as empty with WARNING.
+   - `_normalize_entity_result(None, ...)` returns empty dict and failure string without raising.
+   - Issue entities keyed by `issue.id` (not `issue.iid`).
+   - Empty `raw_data` dict raises `ValueError`.
+   - `project_id <= 0` raises `ValueError`.
+
+#### Acceptance Criteria
+
+- `normalize_project_data()` converts realistic `raw_data` into fully populated `ProjectState`.
+- `StateCompleteness.FULL` only set when zero failures and project not None.
+- `_normalize_entity_result` never raises — all failures captured.
+- `IngestSummary.dropped_records` entries prefixed with entity type.
+- Helper methods never raise; only `normalize_project_data()` may raise on invalid input.
+
+#### Validation Commands
+
+```bash
+pytest tests/test_engines/test_state/test_normalizer.py -v
+ruff check src/delivery_intelligence/engines/state/normalizer.py
+mypy src/delivery_intelligence/engines/state/normalizer.py
+```
+
+#### Files Created or Modified
+
+- `src/delivery_intelligence/engines/state/normalizer.py`
+- `tests/fixtures/state/project_state_full.json`
+- `tests/fixtures/state/project_state_partial.json`
+- `tests/test_engines/test_state/conftest.py`
+- `tests/test_engines/test_state/test_normalizer.py`
+
+---
+
+### Step 3 — Implement In-Memory State Store
+
+> **Status: `NOT_STARTED`**
+
+#### Pre-Step Required Reads
+
+- `src/delivery_intelligence/engines/state/models.py` — verify `ProjectState`, `StateMetadata`, `StateCompleteness`
+- `src/delivery_intelligence/models/base.py` — verify `BaseEntity` (frozen), `EntityStatus`
+- `src/delivery_intelligence/models/pipeline.py` — verify `PipelineStatus` enum values
+
+#### Objective
+
+Build the central in-memory repository. This is the single data source for all downstream phases. Async-safe, query-rich, write-protected from all except `StateManager`.
+
+#### Instructions
+
+1. Create `src/delivery_intelligence/engines/state/store.py` containing:
+
+   **`ProjectStateStore` class:**
+
+   **`__init__(self) -> None`:**
+   - `_states: dict[int, ProjectState] = {}`
+   - `_locks: dict[int, asyncio.Lock] = {}`
+   - `_logger` via `get_logger("state.store")`
+
+   **`async _get_or_create_lock(self, project_id: int) -> asyncio.Lock`:**
+   - Returns existing or creates new `asyncio.Lock` for `project_id`. Idempotent.
+
+   **Write methods (all acquire lock before modifying `_states`):**
+
+   **`async store_state(self, project_id: int, state: ProjectState) -> None`:**
+   - Acquires per-project lock.
+   - Validates `state.project_id == project_id`. Raises `ValueError` if mismatch.
+   - Stores `_states[project_id] = state`.
+   - Logs INFO: `state_stored` with `project_id`, `completeness`, entity counts.
+
+   **`async update_entity(self, project_id: int, entity_type: str, entity: BaseEntity) -> None`:**
+   - Raises `RuntimeError` if `project_id not in _states`.
+   - Acquires per-project lock.
+   - Routes by `entity_type`: `"issue"` → `state.issues`, `"merge_request"` → `state.merge_requests`, `"pipeline"` → `state.pipelines`. Unknown type: raises `ValueError`.
+   - Updates `state.metadata.last_updated_at = datetime.now(timezone.utc)`.
+   - Logs DEBUG: `entity_updated` with `project_id`, `entity_type`, `entity_id=entity.id`.
+
+   **`async clear_project(self, project_id: int) -> None`:**
+   - Acquires lock. Removes `_states[project_id]`. Removes from `_locks`. Logs INFO.
+
+   **`async clear_all(self) -> None`:**
+   - Clears `_states` and `_locks`. Logs INFO with count of cleared projects.
+
+   **Read methods are lock-free for Phase 2 and return the currently stored object/reference or derived lists:**
+
+   **`async get_project_state(self, project_id: int) -> ProjectState | None`:**
+   - Returns `_states.get(project_id)`. Never raises.
+
+   **`async get_state_metadata(self, project_id: int) -> StateMetadata | None`:**
+   - Returns `state.metadata` if tracked, else `None`.
+
+   **`async get_tracked_project_ids(self) -> list[int]`:**
+   - Returns `list(self._states.keys())`.
+
+   **`async get_issues(self, project_id: int, state: EntityStatus | None = None, milestone_id: int | None = None, assignee_id: int | None = None) -> list[Issue]`:**
+   - Returns `[]` if not tracked.
+   - Filters by `state`, `milestone_id`, `assignee_id` using `is not None` guards.
+
+   **`async get_merge_requests(self, project_id: int, state: EntityStatus | None = None, target_branch: str | None = None) -> list[MergeRequest]`:**
+   - Returns `[]` if not tracked. Filters by `state` and `target_branch`.
+
+   **`async get_pipelines(self, project_id: int, ref: str | None = None, status: PipelineStatus | None = None) -> list[Pipeline]`:**
+   - Returns `[]` if not tracked. Filters by `ref` and `status`.
+
+   **`async get_milestone(self, project_id: int, milestone_id: int) -> Milestone | None`:**
+   - Returns `state.milestones.get(milestone_id)` or `None`.
+
+   **`async get_contributor(self, project_id: int, contributor_id: int) -> Contributor | None`:**
+   - Returns `state.contributors.get(contributor_id)` or `None`.
+
+   **`def get_total_entity_count(self) -> int`:**
+   - Sync. Returns sum of all entity counts across all projects. For monitoring.
+
+   **`def is_project_tracked(self, project_id: int) -> bool`:**
+   - Sync. Returns `project_id in self._states`.
+
+2. Create `tests/test_engines/test_state/test_store.py` covering:
+   - `store_state()` stores; `get_project_state()` retrieves.
+   - `store_state()` mismatched `project_id` raises `ValueError`.
+   - `update_entity()` for untracked project raises `RuntimeError`.
+   - `update_entity()` updates correct collection by entity type.
+   - `update_entity()` with unknown entity type raises `ValueError`.
+   - `get_issues()` filters by state, milestone_id, assignee_id.
+   - `get_merge_requests()` filters by state and target_branch.
+   - `get_pipelines()` filters by status.
+   - `get_milestone()` returns None for non-existent ID.
+   - `get_project_state()` returns None for untracked project (does not raise).
+   - `clear_project()` removes state and lock.
+   - `clear_all()` removes all.
+   - `get_tracked_project_ids()` returns correct list.
+
+#### Acceptance Criteria
+
+- All read methods return correct filtered results.
+- `update_entity()` raises `RuntimeError` for untracked project.
+- `store_state()` raises `ValueError` for project_id mismatch.
+- `get_project_state()` returns `None` (not raises) for untracked project.
+- `clear_all()` results in empty `get_tracked_project_ids()`.
+
+#### Validation Commands
+
+```bash
+pytest tests/test_engines/test_state/test_store.py -v
+ruff check src/delivery_intelligence/engines/state/store.py
+mypy src/delivery_intelligence/engines/state/store.py
+```
+
+#### Files Created or Modified
+
+- `src/delivery_intelligence/engines/state/store.py`
+- `tests/test_engines/test_state/test_store.py`
+
+---
+
+### Step 4 — Build Relationship Tracker
+
+> **Status: `NOT_STARTED`**
+
+#### Pre-Step Required Reads
+
+- `src/delivery_intelligence/engines/state/models.py` — verify `EntityRelationship`, `RelationshipIndex`, `RelationshipType`
+- `src/delivery_intelligence/models/issue.py` — verify `assignee_ids`, `milestone_id`
+- `src/delivery_intelligence/models/merge_request.py` — verify `assignee_ids`, `reviewer_ids`, `milestone_id`, `pipeline_id`
+- `src/delivery_intelligence/models/contributor.py` — confirm NO `updated_at`
+
+#### Objective
+
+Extract typed relationships from `ProjectState` and build a bidirectional index. Not a dependency graph — a flat relationship index over current state.
+
+#### Instructions
+
+1. Create `src/delivery_intelligence/engines/state/relationships.py` containing:
+
+   **`RelationshipTracker` class:**
+
+   **`__init__(self) -> None`** — stateless. Logger via `get_logger("state.relationships")`.
+
+   **`extract_from_state(self, state: ProjectState) -> list[EntityRelationship]`:**
+   - Calls all extraction helpers. Aggregates into flat list.
+   - Failed extractions logged at WARNING, skipped — never raises.
+   - Extraction must deduplicate identical relationships by (source_type, source_id, target_type, target_id, relationship_type, project_id).
+   - Logs INFO: `relationships_extracted` with `project_id`, `count`.
+
+   **`_extract_issue_relationships(self, issue: Issue) -> list[EntityRelationship]`:**
+   - If `issue.milestone_id is not None`: add `BELONGS_TO_MILESTONE` (`source_type="issue"`, `target_type="milestone"`, `target_id=issue.milestone_id`).
+   - For each `assignee_id` in `issue.assignee_ids`: add `ASSIGNED_TO` (`target_type="contributor"`, `target_id=assignee_id`).
+
+   **`_extract_mr_relationships(self, mr: MergeRequest) -> list[EntityRelationship]`:**
+   - If `mr.milestone_id is not None`: add `BELONGS_TO_MILESTONE`.
+   - If `mr.pipeline_id is not None`: add `TRIGGERS_PIPELINE` (`source_type="merge_request"`, `target_type="pipeline"`, `target_id=mr.pipeline_id`).
+   - For each `assignee_id` in `mr.assignee_ids`: add `ASSIGNED_TO`.
+   - For each `reviewer_id` in `mr.reviewer_ids`: add `REVIEWED_BY` (`target_type="contributor"`, `target_id=reviewer_id`).
+
+   **`build_index(self, relationships: list[EntityRelationship]) -> RelationshipIndex`:**
+   - Builds `RelationshipIndex` from flat list.
+   - Populates `by_source`, `by_target`, `by_type`.
+   - Empty input returns empty index without error.
+
+   **`update_index_for_entity(self, index: RelationshipIndex, entity_type: str, entity_id: int, new_relationships: list[EntityRelationship]) -> RelationshipIndex`:**
+   - Creates NEW `RelationshipIndex` (does not mutate input).
+   - Copies all existing relationships EXCEPT those where `source_type==entity_type and source_id==entity_id`.
+   - Adds `new_relationships`.
+   - Rebuilds all three index dicts.
+   - Returns new index.
+
+2. Create `tests/test_engines/test_state/test_relationships.py` covering:
+   - Issue with milestone: `BELONGS_TO_MILESTONE` extracted.
+   - Issue with `assignee_ids=[1, 2]`: 2 `ASSIGNED_TO` relationships.
+   - Issue with duplicate `assignee_ids=[1, 1, 2]`: deduplicates to 2 relationships.
+   - Issue with `milestone_id=None`: no milestone relationship.
+   - MR with `pipeline_id`: `TRIGGERS_PIPELINE` extracted.
+   - MR with `reviewer_ids`: `REVIEWED_BY` extracted.
+   - `build_index()` populates `by_source`, `by_target`, `by_type`.
+   - `index.get_relationships_from("issue", id)` returns correct list.
+   - `index.get_relationships_to("milestone", id)` returns all issues in that milestone.
+   - `index.count()` correct.
+   - `update_index_for_entity()` returns new index with replaced relationships.
+   - Empty state: empty index, no error.
+
+#### Acceptance Criteria
+
+- All 4 relationship types extracted correctly.
+- Bidirectional lookup via `by_source` and `by_target`.
+- `update_index_for_entity()` returns new index with replaced relationships.
+- `None` optional fields handled without raising.
+
+#### Validation Commands
+
+```bash
+pytest tests/test_engines/test_state/test_relationships.py -v
+ruff check src/delivery_intelligence/engines/state/relationships.py
+mypy src/delivery_intelligence/engines/state/relationships.py
+```
+
+#### Files Created or Modified
+
+- `src/delivery_intelligence/engines/state/relationships.py`
+- `tests/test_engines/test_state/test_relationships.py`
+
+---
+
+### Step 5 — Implement Consistency Checker
+
+> **Status: `NOT_STARTED`**
+
+#### Pre-Step Required Reads
+
+- `src/delivery_intelligence/engines/state/models.py` — verify `ConsistencyIssue`, `ConsistencyReport`, `StateCompleteness`, `StateHealth`
+
+#### Objective
+
+Validate `ProjectState` integrity without modifying it. Produces a `ConsistencyReport`.
+
+#### Instructions
+
+1. Create `src/delivery_intelligence/engines/state/consistency.py` containing:
+
+   **Module constant:** `_STALE_STATE_HOURS: int = 24`
+
+   **`ConsistencyChecker` class:**
+
+   **`__init__(self, stale_hours: int = _STALE_STATE_HOURS) -> None`** — logger via `get_logger("state.consistency")`.
+
+   **`check_project(self, state: ProjectState) -> ConsistencyReport`:**
+   - Runs all checks. Collects issues.
+   - `is_healthy = not any(i.severity == "ERROR" for i in issues)`.
+   - Logs INFO: `consistency_check_completed` with `project_id`, `issue_count`, `is_healthy`.
+   - Returns `ConsistencyReport`.
+
+   **`_check_orphaned_milestone_references(self, state: ProjectState) -> list[ConsistencyIssue]`:**
+   - Issues and MRs referencing milestone_id not in `state.milestones` → WARNING, `check_name="orphaned_milestone_reference"`.
+
+   **`_check_orphaned_pipeline_references(self, state: ProjectState) -> list[ConsistencyIssue]`:**
+   - MRs referencing `pipeline_id` not in `state.pipelines` → WARNING, `check_name="orphaned_pipeline_reference"`.
+
+   **`_check_stale_state(self, state: ProjectState) -> list[ConsistencyIssue]`:**
+   - `last_refresh_at is None` → WARNING `check_name="never_refreshed"`.
+   - Older than `stale_hours` → WARNING `check_name="stale_state"`, description includes hours elapsed.
+
+   **`_check_incomplete_completeness(self, state: ProjectState) -> list[ConsistencyIssue]`:**
+   - `completeness == PARTIAL` → WARNING `check_name="incomplete_state"`.
+
+   **`_check_contributor_consistency(self, state: ProjectState) -> list[ConsistencyIssue]`:**
+   - Assignee IDs on issues not in `state.contributors` → WARNING `check_name="unknown_issue_assignee"`. 
+   - Assignee IDs on MRs not in `state.contributors` → WARNING `check_name="unknown_mr_assignee"`.
+   - Reviewer IDs on MRs not in `state.contributors` → WARNING `check_name="unknown_mr_reviewer"`.
+   - Track seen contributor IDs to avoid duplicate warnings for the same ID across all check types.
+
+   **`compute_state_health(self, report: ConsistencyReport, completeness: StateCompleteness) -> StateHealth`:**
+   - Evaluation order (first match wins):
+     1. `UNKNOWN` if `completeness == StateCompleteness.EMPTY`.
+     2. `STALE` if any issue has `check_name in ("stale_state", "never_refreshed")`.
+     3. `DEGRADED` if `not report.is_healthy` OR `completeness == StateCompleteness.PARTIAL` OR any issues exist.
+     4. `HEALTHY` otherwise.
+
+2. Create `tests/test_engines/test_state/test_consistency.py` covering:
+   - Orphaned milestone reference → WARNING issue.
+   - Orphaned pipeline reference → WARNING issue.
+   - Never refreshed → `never_refreshed` WARNING.
+   - Refreshed 25h ago → `stale_state` WARNING.
+   - Refreshed 1h ago → no stale issue.
+   - PARTIAL completeness → `incomplete_state` WARNING.
+   - Unknown assignee → WARNING.
+   - Unknown MR assignee or reviewer → WARNING.
+   - Clean state → `ConsistencyReport(is_healthy=True, issues=[])`.
+   - WARNING does not set `is_healthy=False`.
+   - `compute_state_health()` correct for each scenario.
+   - No duplicate warnings for same contributor_id across all check types.
+
+#### Acceptance Criteria
+
+- All 5 check types produce correct `ConsistencyIssue` instances.
+- `is_healthy=True` for clean state.
+- WARNING never flips `is_healthy`.
+- `compute_state_health()` follows defined priority order.
+
+#### Validation Commands
+
+```bash
+pytest tests/test_engines/test_state/test_consistency.py -v
+ruff check src/delivery_intelligence/engines/state/consistency.py
+mypy src/delivery_intelligence/engines/state/consistency.py
+```
+
+#### Files Created or Modified
+
+- `src/delivery_intelligence/engines/state/consistency.py`
+- `tests/test_engines/test_state/test_consistency.py`
+
+---
+
+### Step 6 — Implement State Manager: Full Refresh
+
+> **Status: `NOT_STARTED`**
+
+#### Pre-Step Required Reads
+
+- `src/delivery_intelligence/core/container.py` — verify `get_fetcher()`, `_initialized` guard
+- `src/delivery_intelligence/gitlab/fetchers.py` — verify `fetch_all_project_data()` return dict keys
+- All `src/delivery_intelligence/engines/state/` files — verify constructor signatures
+
+#### Objective
+
+Build `StateManager` — the orchestrator that coordinates a full refresh: calls fetcher, normalizes, extracts relationships, runs consistency, stores final state.
+
+#### Instructions
+
+1. Create `src/delivery_intelligence/engines/state/manager.py` containing:
+
+   **Type import section:**
+   ```python
+   from __future__ import annotations
+   
+   from typing import TYPE_CHECKING
+   
+   if TYPE_CHECKING:
+       from delivery_intelligence.gitlab.fetchers import GitLabFetcher
+   ```
+
+   **Module constant:** `_MAX_CONCURRENT_REFRESHES: int = 3`
+
+   **`StateManager` class:**
+
+   **`__init__(self, store: ProjectStateStore, normalizer: StateNormalizer, relationship_tracker: RelationshipTracker, consistency_checker: ConsistencyChecker) -> None`:**
+   - Stores dependencies as private attributes.
+   - Logger via `get_logger("state.manager")`.
+
+   **`async refresh_project(self, project_id: int, fetcher: GitLabFetcher) -> IngestSummary`:**
+   - Validates `project_id > 0`. Raise `ValueError` if not.
+
+   Authoritative 17-step flow:
+   1. `started_at = datetime.now(timezone.utc)`.
+   2. Log INFO: `project_refresh_started` with `project_id`.
+   3. `raw_data = await fetcher.fetch_all_project_data(project_id)`.
+   4. `state, summary = self._normalizer.normalize_project_data(project_id, raw_data)`.
+   5. `relationships = self._relationship_tracker.extract_from_state(state)`.
+   6. `index = self._relationship_tracker.build_index(relationships)`.
+   7. `state.relationship_index = index`.
+   8. `summary.relationships_extracted = index.count()`.
+   9. `state.metadata.last_refresh_at = datetime.now(timezone.utc)`.
+   10. `state.metadata.last_updated_at = state.metadata.last_refresh_at`.
+   11. `report = self._consistency_checker.check_project(state)`.
+   12. `summary.consistency_issues = len(report.issues)`.
+   13. `state.metadata.health = self._consistency_checker.compute_state_health(report, state.metadata.completeness)`.
+   14. `await self._store.store_state(project_id, state)`.
+   15. `summary.completed_at = datetime.now(timezone.utc)`.
+   16. Log INFO: `project_refresh_completed` with `project_id`, `completeness`, entity counts, `failures`, `relationships_extracted`, `consistency_issues`, `duration_seconds`.
+   17. Return `summary`.
+
+   **`async refresh_multiple_projects(self, project_ids: list[int], fetcher: GitLabFetcher) -> dict[int, IngestSummary]`:**
+   - Deduplicates `project_ids` while preserving first occurrence.
+   - `asyncio.Semaphore(_MAX_CONCURRENT_REFRESHES)`.
+   - For each project task, records a per-project started_at before calling refresh_project().
+   - `asyncio.gather(*tasks, return_exceptions=True)`.
+   - Handle exceptions per Pattern C. If a task fails, use that per-project timestamp in the fallback IngestSummary. Never raises for individual failures.
+   - Returns `dict[int, IngestSummary]`.
+
+   **`async get_project_health(self, project_id: int) -> tuple[StateHealth, ConsistencyReport] | None`:**
+   - Returns `None` if not tracked.
+   - Gets state, runs check, computes health.
+   - Does not modify state.
+
+2. Create `tests/test_engines/test_state/test_manager.py` covering:
+   - `refresh_project()` calls all dependencies in order.
+   - Returned `IngestSummary` has correct counts.
+   - `StateCompleteness.FULL` when no failures.
+   - `StateCompleteness.PARTIAL` when failures.
+   - `summary.relationships_extracted` matches index count.
+   - `refresh_multiple_projects()` handles concurrent refreshes.
+   - `refresh_multiple_projects()` deduplicates input project IDs.
+   - One project fails → returns error summary for that project, others succeed.
+   - Semaphore limits concurrency.
+   - `project_id <= 0` raises `ValueError`.
+   - All dependencies mocked — no real API calls.
+
+#### Acceptance Criteria
+
+- All 17 flow steps execute in order.
+- State stored is complete: entities, relationship index, metadata all set.
+- Concurrent refresh errors isolated.
+- No direct GitLab API imports (Invariant 4).
+- Input validation raises `ValueError` for `project_id <= 0`.
+
+#### Validation Commands
+
+```bash
+pytest tests/test_engines/test_state/test_manager.py -v
+ruff check src/delivery_intelligence/engines/state/manager.py
+mypy src/delivery_intelligence/engines/state/manager.py
+```
+
+#### Files Created or Modified
+
+- `src/delivery_intelligence/engines/state/manager.py`
+- `tests/test_engines/test_state/test_manager.py`
+
+---
+
+### Step 7 — Incremental Updates, Container Registration, and Integration Tests
+
+> **Status: `NOT_STARTED`**
+
+#### Pre-Step Required Reads
+
+- `src/delivery_intelligence/gitlab/webhooks.py` — verify `WebhookPayload` fields, `WebhookEvent`, `map_webhook_to_model()` semantics
+- `src/delivery_intelligence/core/container.py` — verify all existing attributes and `initialize()`/`shutdown()` bodies
+- `src/delivery_intelligence/engines/state/manager.py` — verify `StateManager` constructor
+- `src/delivery_intelligence/engines/state/store.py` — verify `update_entity()` signature
+- `src/delivery_intelligence/engines/state/models.py` — verify `UpdateResult`, `UpdateSource`, canonical reason strings
+
+#### Objective
+
+Complete Phase 2 by: (1) adding the webhook-driven incremental update path to `StateManager`, (2) registering all Phase 2 components in `Container`, (3) populating `engines/state/__init__.py`, (4) writing end-to-end integration tests.
+
+#### Instructions
+
+**Part A — Add Incremental Update to StateManager**
+
+Add to `manager.py`:
+
+**`async apply_webhook_event(self, payload: WebhookPayload) -> UpdateResult`:**
+
+Validates `payload.project_id > 0`. Raise `ValueError` if not.
+
+Authoritative flow:
+1. `if not self._store.is_project_tracked(payload.project_id)`: log DEBUG `webhook_project_not_tracked`. Return `UpdateResult(..., applied=False, reason="project_not_tracked")`.
+2. `state = await self._store.get_project_state(payload.project_id)`. If `None`: log WARNING. Return `UpdateResult(..., applied=False, reason="no_state_for_project")`.
+3. Call `map_webhook_to_model(payload)`:
+   - Returns `None` (PUSH/NOTE/UNKNOWN): log DEBUG. Return `UpdateResult(..., applied=False, reason="event_type_not_tracked")`.
+   - Raises `ValueError`: log ERROR per Pattern B. Return `UpdateResult(..., applied=False, reason="mapping_failed")`.
+4. Determine `entity_type`: `ISSUE` → `"issue"`, `MERGE_REQUEST` → `"merge_request"`, `PIPELINE` → `"pipeline"`.
+5. Get stored entity from correct collection by `entity.id`.
+6. **Timestamp guard (Invariant 3):** If `payload.entity_updated_at is not None` AND stored entity exists AND `payload.entity_updated_at <= stored_entity.updated_at`: log DEBUG `stale_event_discarded` with `project_id`, `entity_type`, `entity_id`, timestamps. Return `UpdateResult(..., applied=False, reason="stale_event_discarded")`.
+7. `await self._store.update_entity(payload.project_id, entity_type, entity)`.
+8. Extract new relationships for updated entity. Call `update_index_for_entity()`. Update `state.relationship_index`.
+9. Re-run consistency check and update `state.metadata.health`.
+10. `state.metadata.last_updated_at = datetime.now(timezone.utc)`.
+11. Log INFO: `webhook_entity_updated` with `project_id`, `entity_type`, `entity_id`.
+12. Return `UpdateResult(..., applied=True, reason="applied")`.
+
+**CRITICAL:** If `payload.entity_updated_at is None`: skip step 6 entirely and proceed with the update.
+
+---
+
+**Part B — Container Registration**
+
+Modify `src/delivery_intelligence/core/container.py`:
+
+1. Add imports for all Phase 2 components.
+2. Add to `__init__()`:
+   ```python
+   self._state_store: ProjectStateStore | None = None
+   self._state_normalizer: StateNormalizer | None = None
+   self._relationship_tracker: RelationshipTracker | None = None
+   self._consistency_checker: ConsistencyChecker | None = None
+   self._state_manager: StateManager | None = None
+   ```
+3. Add to `initialize()` after Phase 1 components:
+   ```python
+   self._state_store = ProjectStateStore()
+   self._state_normalizer = StateNormalizer()
+   self._relationship_tracker = RelationshipTracker()
+   self._consistency_checker = ConsistencyChecker()
+   self._state_manager = StateManager(
+       store=self._state_store,
+       normalizer=self._state_normalizer,
+       relationship_tracker=self._relationship_tracker,
+       consistency_checker=self._consistency_checker,
+   )
+   logger.info("state_engine_initialized", component="ProjectStateEngine")
+   ```
+4. Add accessors (all require `_check_initialized()`):
+   - `def get_state_store(self) -> ProjectStateStore`
+   - `def get_state_manager(self) -> StateManager`
+5. Add to `async shutdown()` before setting `_initialized = False`:
+   ```python
+   if self._state_store is not None:
+       await self._state_store.clear_all()
+       self._state_store = None
+   self._state_normalizer = None
+   self._relationship_tracker = None
+   self._consistency_checker = None
+   self._state_manager = None
+   ```
+
+---
+
+**Part C — Update `engines/state/__init__.py`**
+
+```python
+from delivery_intelligence.engines.state.models import (
+    StateCompleteness, StateHealth, RelationshipType, UpdateSource,
+    EntityRelationship, RelationshipIndex, StateMetadata,
+    IngestSummary, UpdateResult, ConsistencyIssue, ConsistencyReport,
+    ProjectState,
+)
+from delivery_intelligence.engines.state.store import ProjectStateStore
+from delivery_intelligence.engines.state.normalizer import StateNormalizer
+from delivery_intelligence.engines.state.relationships import RelationshipTracker
+from delivery_intelligence.engines.state.consistency import ConsistencyChecker
+from delivery_intelligence.engines.state.manager import StateManager
+```
+
+---
+
+**Part D — Integration Tests**
+
+Create `tests/test_engines/test_state/test_integration.py`:
+
+**`test_full_refresh_pipeline`** — Mock fetcher. Call `refresh_project()`. Assert `ProjectState` fully populated, `completeness=FULL`, `last_refresh_at` set and UTC-aware, `relationship_index.count() > 0`, `IngestSummary.entities_loaded` counts correct.
+
+**`test_partial_refresh_on_fetch_failures`** — Mock fetcher returning `failures=2` in issues. Assert `completeness=PARTIAL`, `dropped_records` has 2 entries, `entities_failed["issues"] == 2`.
+
+**`test_webhook_incremental_update`** — Full refresh first. Create `WebhookPayload` for ISSUE with `entity_updated_at` newer than stored. Call `apply_webhook_event()`. Assert `UpdateResult.applied is True`. Assert stored issue updated. Assert `last_updated_at` updated.
+
+**`test_stale_webhook_discarded`** — Full refresh. Create webhook with `entity_updated_at` OLDER than stored `updated_at`. Assert `UpdateResult.applied is False`, `reason == "stale_event_discarded"`. Assert stored issue unchanged.
+
+**`test_webhook_none_entity_updated_at`** — Full refresh. Webhook with `entity_updated_at=None`. Assert `UpdateResult.applied is True`. Missing timestamp must not discard.
+
+**`test_webhook_unknown_event_not_applied`** — Full refresh. Webhook with `event_type=WebhookEvent.PUSH`. Assert `applied=False`, `reason="event_type_not_tracked"`.
+
+**`test_webhook_untracked_project`** — Empty store. Webhook for project 999. Assert `applied=False`, `reason="project_not_tracked"`.
+
+**`test_relationship_extraction`** — Full refresh with issue having `milestone_id` and MR having `pipeline_id`. Assert `index.get_relationships_from("issue", issue_id)` returns `BELONGS_TO_MILESTONE`. Assert `index.get_relationships_to("milestone", milestone_id)` returns that issue. Assert `index.get_relationships_from("merge_request", mr_id)` returns `TRIGGERS_PIPELINE`.
+
+**`test_consistency_check_after_refresh`** — Full refresh with issue referencing non-existent `milestone_id`. Call `get_project_health()`. Assert report contains `orphaned_milestone_reference`. Assert health is not `HEALTHY`.
+
+**`test_webhook_updates_consistency_and_health`** — Refresh, then webhook that introduces consistency issue. Assert health updated after webhook.
+
+**`test_multiple_project_concurrent_refresh`** — Mock fetcher for 3 projects. Call `refresh_multiple_projects()`. Assert all 3 have summaries and are tracked.
+
+**`test_container_state_lifecycle`** — Initialize container. `get_state_store()` and `get_state_manager()` return instances. Refresh a project. Verify state exists. Store reference to state store. `await container.shutdown()`. Verify container accessor raises and previous store reference has been cleared.
+
+**`test_get_state_store_before_init_raises`** — Do not call `initialize()`. Assert `container.get_state_store()` raises `RuntimeError`.
+
+**`test_webhook_payload_validation`** — Test `apply_webhook_event()` with `payload.project_id <= 0` raises `ValueError`.
+
+#### Acceptance Criteria
+
+- All integration scenarios pass.
+- `container.get_state_store()` raises `RuntimeError` before `initialize()`.
+- `await container.shutdown()` clears state store.
+- Stale webhooks discarded, state unchanged.
+- Webhooks with `entity_updated_at=None` applied.
+- Webhook updates trigger consistency re-computation and health update.
+- All Phase 0 and Phase 1 tests still pass.
+- Payload validation on both refresh and webhook methods.
+
+#### Validation Commands
+
+```bash
+pytest tests/test_engines/test_state/test_integration.py -v
+pytest tests/ -v
+ruff check src/ tests/
+mypy src/delivery_intelligence/engines/state/
+mypy src/delivery_intelligence/core/container.py
+python -c "import delivery_intelligence.engines.state"
+```
+
+#### Files Created or Modified
+
+- `src/delivery_intelligence/engines/state/manager.py` (extended)
+- `src/delivery_intelligence/engines/state/__init__.py` (populated)
+- `src/delivery_intelligence/core/container.py` (extended)
+- `tests/test_engines/test_state/test_integration.py`
+- `tests/test_core/test_container.py` (extended with Phase 2 accessor tests)
+
+---
+
+## Phase 2 Completion Checklist
+
+| # | Check | Verified |
+|---|---|---|
+| 1 | All Phase 2 directories and files exist | `NO` |
+| 2 | `python -c "import delivery_intelligence.engines.state"` succeeds | `NO` |
+| 3 | All Phase 0 tests still pass | `NO` |
+| 4 | All Phase 1 tests still pass | `NO` |
+| 5 | `StateCompleteness.FULL` only set when zero failures and project not None | `NO` |
+| 6 | `StateCompleteness.PARTIAL` set when any FetchResult has failures > 0 | `NO` |
+| 7 | `ProjectState` entity dicts keyed by `entity.id` not `entity.iid` | `NO` |
+| 8 | Store write methods acquire per-project lock | `NO` |
+| 9 | `store.update_entity()` raises `RuntimeError` for untracked project | `NO` |
+| 10 | `store.store_state()` raises `ValueError` for mismatched project_id | `NO` |
+| 11 | `store.get_project_state()` returns None (not raises) for untracked project | `NO` |
+| 12 | `get_issues()` filters by state, milestone_id, assignee_id | `NO` |
+| 13 | `get_merge_requests()` filters by state and target_branch | `NO` |
+| 14 | `get_pipelines()` filters by ref and status | `NO` |
+| 15 | `RelationshipTracker` extracts `BELONGS_TO_MILESTONE` for issues and MRs | `NO` |
+| 16 | `RelationshipTracker` extracts `TRIGGERS_PIPELINE` for MRs | `NO` |
+| 17 | `RelationshipTracker` extracts `ASSIGNED_TO` for all assignee_ids | `NO` |
+| 18 | `RelationshipTracker` extracts `REVIEWED_BY` for all reviewer_ids | `NO` |
+| 19 | `RelationshipIndex` supports bidirectional lookup | `NO` |
+| 20 | `update_index_for_entity()` returns new index with replaced relationships | `NO` |
+| 21 | `ConsistencyChecker` detects orphaned milestone references | `NO` |
+| 22 | `ConsistencyChecker` detects orphaned pipeline references | `NO` |
+| 23 | `ConsistencyChecker` detects stale state (> 24h) | `NO` |
+| 24 | `ConsistencyChecker` detects PARTIAL completeness | `NO` |
+| 25 | `ConsistencyChecker` detects unknown assignee IDs | `NO` |
+| 26 | WARNING issues do NOT set `is_healthy=False` | `NO` |
+| 27 | `compute_state_health()` follows UNKNOWN→STALE→DEGRADED→HEALTHY priority | `NO` |
+| 28 | `StateManager.refresh_project()` executes all 17 flow steps | `NO` |
+| 29 | `refresh_project()` sets `last_refresh_at` and `last_updated_at` | `NO` |
+| 30 | `refresh_project()` sets `state.relationship_index` | `NO` |
+| 31 | `refresh_project()` runs consistency check and sets `metadata.health` | `NO` |
+| 32 | `refresh_multiple_projects()` uses semaphore limited to 3 | `NO` |
+| 33 | `refresh_multiple_projects()` isolates individual project failures | `NO` |
+| 34 | `refresh_multiple_projects()` deduplicates input project IDs | `NO` |
+| 35 | `apply_webhook_event()` returns `UpdateResult` for all code paths | `NO` |
+| 36 | Stale webhook discarded with DEBUG log, state unchanged | `NO` |
+| 37 | Webhook with `entity_updated_at=None` applied | `NO` |
+| 38 | PUSH/NOTE/UNKNOWN → `applied=False`, `reason="event_type_not_tracked"` | `NO` |
+| 39 | Untracked project → `applied=False`, `reason="project_not_tracked"` | `NO` |
+| 40 | Mapping failure → `applied=False`, `reason="mapping_failed"` with ERROR log | `NO` |
+| 41 | Webhook updates `last_updated_at` and re-runs consistency check | `NO` |
+| 42 | No runtime import from `gitlab/fetchers.py` in `engines/state/` | `NO` |
+| 43 | `StateNormalizer` helpers never raise — all failures captured | `NO` |
+| 44 | `IngestSummary.dropped_records` entries prefixed with entity type | `NO` |
+| 45 | `container.get_state_store()` raises `RuntimeError` before `initialize()` | `NO` |
+| 46 | `container.get_state_manager()` raises `RuntimeError` before `initialize()` | `NO` |
+| 47 | `await container.shutdown()` clears state store | `NO` |
+| 48 | `engines/state/__init__.py` exports all public symbols | `NO` |
+| 49 | All dataclass list/dict fields use `field(default_factory=...)` | `NO` |
+| 50 | No Phase 2 state model uses `frozen=True` | `NO` |
+| 51 | `ProjectState` metadata initialized via `__post_init__` | `NO` |
+| 52 | `refresh_project()` validates `project_id > 0` | `NO` |
+| 53 | `apply_webhook_event()` validates `payload.project_id > 0` | `NO` |
+| 54 | `ruff check src/ tests/` reports no errors | `NO` |
+| 55 | `mypy src/delivery_intelligence/engines/state/` passes | `NO` |
+| 56 | No circular imports exist | `NO` |
+| 57 | All integration tests pass | `NO` |
+
+---
+
+## Status Summary
+
+| Step | Name | Status | Last Updated |
+|---|---|---|---|
+| Step 1 | Define State Domain Models | `NOT_STARTED` | — |
+| Step 2 | Build State Normalizer | `NOT_STARTED` | — |
+| Step 3 | Implement In-Memory State Store | `NOT_STARTED` | — |
+| Step 4 | Build Relationship Tracker | `NOT_STARTED` | — |
+| Step 5 | Implement Consistency Checker | `NOT_STARTED` | — |
+| Step 6 | Implement State Manager: Full Refresh | `NOT_STARTED` | — |
+| Step 7 | Incremental Updates, Container Registration, Integration Tests | `NOT_STARTED` | — |
+
+**Phase 2 Overall Status: `NOT_STARTED`**
+
+---
+
+## Implementation Advice (Read Before Starting)
+
+1. **Run the Pre-Implementation Protocol before every step.** Source files are truth. Memory is not.
+2. **Keep Phase 2 analytics-free.** Temptation to compute velocity or risk will arise. Resist it. The state engine is a data structure.
+3. **Key entity dicts by `entity.id`, not `entity.iid`.** Getting this wrong corrupts every lookup and every relationship. It is the single most common implementation error in this phase.
+4. **`Contributor` has no `updated_at`.** Write tests that specifically verify this is not accessed. Any code that iterates all entities and accesses `updated_at` will crash on contributors.
+5. **`StateCompleteness` is the most critical data quality signal.** Never set `FULL` when failures exist. This flag is the first thing Phase 3 will check before trusting state.
+6. **State models are mutable dataclasses.** No `.model_copy()`, no `.model_dump()`. Direct attribute access. Phase 0 domain models inside them ARE frozen — never mutate those.
+7. **The per-project lock is non-negotiable for writes.** All reads in asyncio single-thread context are safe without locks. Only writes need them.
+8. **Webhooks never upgrade completeness.** If state is PARTIAL, a webhook keeps it PARTIAL. Only a complete successful full refresh may set FULL.
+9. **`entity_updated_at=None` means apply.** The timestamp guard fires only when both sides have a non-None timestamp and incoming <= stored. None means unknown — default to applying.
+10. **Run `pytest tests/ -v` after every step.** Phase 0 and Phase 1 tests are non-negotiable. Breaking them is a blocker, not a warning.
+
+---
+
+## Rules for the LLM Coder
+
+1. **Execute steps in order.** Do not jump ahead.
+2. **Run the Verification Protocol** before marking any step `COMPLETE`.
+3. **Update the status table** after completing each step.
+4. **Run all validation commands.** All must pass.
+5. **Never use f-strings in log calls.** Structlog key-value binding only.
+6. **Use type hints everywhere.**
+7. **Write defensive code.** Validate inputs. Handle errors explicitly.
+8. **Keep functions small.** One responsibility.
+9. **Write meaningful docstrings.** Every public class and function.
+10. **No placeholder code.** No `pass`, `TODO`, `# implement later`.
+11. **No global mutable state.**
+12. **Test edge cases.** Empty FetchResults, None fields, stale webhooks, untracked projects.
+13. **No unlisted frameworks or tools.**
+14. **No unlisted files or modules.**
+15. **All Phase 0 and Phase 1 tests must still pass after every step.**
+16. **No silent errors.** Every failure = log + caller signal.
+17. **Re-read source files before each step.**
+18. **Never set `StateCompleteness.FULL` when failures exist.** This is the cardinal rule of Phase 2.
+19. **When in doubt: raise. It is always safer to surface an error loudly than to hide it quietly.**
+
+---
+
+## What Comes Next
+
+After Phase 2 is complete, Phase 3 (Time-Series Engine) begins. Phase 3 will:
+
+- Read entity state from `ProjectStateStore` via `Container.get_state_store()` exclusively — never from Phase 1 fetchers directly (Invariant 1 enforced)
+- Subscribe to `UpdateResult` events from `StateManager.apply_webhook_event()` to track state transitions in real time
+- Record state change history: issue transitions (OPEN → CLOSED), MR lifecycle (OPEN → MERGED), pipeline outcomes (RUNNING → SUCCESS/FAILED)
+- Use `IngestSummary.entities_loaded` counts over time to compute throughput metrics
+- Build velocity timeseries: issues closed per day, MRs merged per sprint, pipeline success rate
+- Detect trajectory changes: is velocity accelerating or decelerating? Is pipeline failure rate trending up?
+- Require Phase 2 state to have `StateCompleteness.FULL` or `PARTIAL` (never `EMPTY`) before trusting as a data point
+- Use `StateMetadata.last_refresh_at` as the timestamp anchor for each state snapshot
+
+Every decision made in Phase 2 directly enables Phase 3. A well-structured, consistently complete, relationship-indexed state is the foundation of all temporal and predictive intelligence.
