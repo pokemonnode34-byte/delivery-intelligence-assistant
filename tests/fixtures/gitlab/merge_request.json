@@ -1,0 +1,23 @@
+{
+  "id": 200,
+  "iid": 10,
+  "project_id": 1,
+  "title": "Add feature X",
+  "description": "Adds feature X",
+  "state": "opened",
+  "source_branch": "feature/x",
+  "target_branch": "main",
+  "author": {"id": 42, "username": "alice"},
+  "assignees": [{"id": 43, "username": "bob"}],
+  "reviewers": [{"id": 44, "username": "carol"}],
+  "labels": ["needs-review"],
+  "milestone": null,
+  "pipeline": {"id": 500},
+  "has_conflicts": false,
+  "draft": false,
+  "changes_count": "12",
+  "created_at": "2024-01-01T00:00:00Z",
+  "updated_at": "2024-01-15T10:00:00Z",
+  "merged_at": null,
+  "closed_at": null
+}

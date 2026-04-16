@@ -1,0 +1,8 @@
+{
+  "object_kind": "push",
+  "event_name": "push",
+  "project": {"id": 1, "name": "my-project"},
+  "project_id": 1,
+  "commits": [{"id": "abc123", "message": "Fix bug"}],
+  "ref": "refs/heads/main"
+}
