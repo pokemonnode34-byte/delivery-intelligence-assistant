@@ -7,7 +7,7 @@ import re
 import httpx
 
 _TOKEN_PATTERNS = (
-    re.compile(r"(glpat-)[A-Za-z0-9_\-]+", re.IGNORECASE),
+    re.compile(r"(glpat-)[A-Za-z0-9_-]+", re.IGNORECASE),
     re.compile(r"(?i)\b(authorization)\s*:\s*bearer\s+[^\s,;]+"),
     re.compile(r"(?i)\b(private[_-]?token|access[_-]?token|token|password)\s*=\s*([^&\s]+)"),
     re.compile(r"(?i)\b(private[_-]?token|access[_-]?token|token|password)\s*:\s*([^\s,;]+)"),
